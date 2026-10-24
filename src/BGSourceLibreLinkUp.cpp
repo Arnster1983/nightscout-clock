@@ -387,7 +387,7 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::updateReadings(
 std::list<GlucoseReading> BGSourceLibreLinkUp::getReadings(unsigned long long lastReadingEpoch) {
     auto readingFromConnection = getLibreLinkUpConnection();
 
-    if (readingFromConnection.isEmpty() || lastCallAttemptEpoch >= readingFromConnection.epoch) {
+    if (readingFromConnection.isEmpty() || readingFromConnection.epoch <= lastReadingEpoch) {
 #ifdef DEBUG_BG_SOURCE
         DEBUG_PRINTF(
             "No readings needed, last reading epoch %llu is already in\n", lastCallAttemptEpoch);
