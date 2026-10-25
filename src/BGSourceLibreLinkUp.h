@@ -46,6 +46,7 @@ private:
     int retryCount = 0;
     bool hasValidAuthentication();
     void deleteAuthTicket();
+    void resetHttpClients();
     AuthTicket login();
     AuthTicket authTicket;
     std::list<GlucoseReading> getReadings(unsigned long long lastReadingEpoch);
