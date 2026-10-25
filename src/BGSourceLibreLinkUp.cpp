@@ -5,6 +5,25 @@
 
 #define TIMESTAMP_FIELD "FactoryTimestamp"
 
+// Handling of temporary problems (no scrolling error text, the last value stays on screen):
+// consecutive polls without fresh data from LibreLinkUp because of an error
+static uint16_t consecutiveFailedPolls = 0;
+// after Abbott refused a login (401/403/429) wait before the next login attempt
+static unsigned long long loginRetryAfter = 0;
+#define LOGIN_BACKOFF_SECONDS 600
+#define FAILED_POLLS_SHOW_ERROR 60
+
+static void noteFailedPoll() {
+    consecutiveFailedPolls++;
+    // About one hour of errors while the WiFi itself is up: this is no longer temporary.
+    // Tell the user (the error screen restarts the clock afterwards, which also clears a
+    // stuck network/TLS state). While the WiFi is down we just wait: WiFi auto-reconnect is
+    // on, and a restart without WiFi would put the clock into access point mode.
+    if (consecutiveFailedPolls >= FAILED_POLLS_SHOW_ERROR && WiFi.status() == WL_CONNECTED) {
+        DisplayManager.showFatalError("No LibreLinkUp data for 1 hour, check internet and LibreLinkUp app");
+    }
+}
+
 bool BGSourceLibreLinkUp::hasValidAuthentication() {
 #ifdef DEBUG_BG_SOURCE
     DEBUG_PRINTF(
@@ -84,6 +103,9 @@ AuthTicket BGSourceLibreLinkUp::login() {
         // clock tries again on the next poll.
         DEBUG_PRINTF("Error logging in to LibreLinkUp %d, will retry\n", responseCode);
         status = "connection_error";
+        if (responseCode == 401 || responseCode == 403 || responseCode == 429) {
+            loginRetryAfter = time(NULL) + LOGIN_BACKOFF_SECONDS;
+        }
         client->end();
         return AuthTicket();
     }
@@ -149,7 +171,7 @@ AuthTicket BGSourceLibreLinkUp::login() {
 unsigned long long BGSourceLibreLinkUp::libreTimestampToEpoch(String dateString) {
     setenv("TZ", "UTC0", 1);
     tzset();
-    struct tm tm;
+    struct tm tm = {};
     strptime(dateString.c_str(), "%m/%d/%Y", &tm);
     // parse the time part without using strptime to avoid AM/PM bug
     String timePart = dateString.substring(dateString.indexOf(' ') + 1);
@@ -239,6 +261,7 @@ GlucoseReading BGSourceLibreLinkUp::getLibreLinkUpConnection() {
         DEBUG_PRINTF("Error deserializing LibreLinkUp connections response: %s, will retry\n",
             error.c_str());
         status = "connection_error";
+        client->end();
         return GlucoseReading();
     }
 
@@ -250,6 +273,7 @@ GlucoseReading BGSourceLibreLinkUp::getLibreLinkUpConnection() {
             response.c_str());
         status = "connection_error";
         deleteAuthTicket();
+        client->end();
         return GlucoseReading();
     }
 
@@ -306,6 +330,11 @@ GlucoseReading BGSourceLibreLinkUp::getLibreLinkUpConnection() {
 #endif
 
     status = "connected";
+    firstConnectionSuccess = true;
+    if (reading.sgv <= 0 || reading.epoch == 0) {
+        // no current measurement (e.g. sensor ended): never show it as a fresh value
+        return GlucoseReading();
+    }
     return reading;
 }
 
@@ -326,10 +355,16 @@ String BGSourceLibreLinkUp::encodeSHA256(String toEncode) {
 std::list<GlucoseReading> BGSourceLibreLinkUp::updateReadings(
     std::list<GlucoseReading> existingReadings) {
     if (!hasValidAuthentication()) {
+        if (time(NULL) < loginRetryAfter) {
+            noteFailedPoll();  // Abbott refused the last login, wait before trying again
+            return existingReadings;
+        }
         deleteAuthTicket();
+        status = "initialized";  // so only a failure of this login counts below
         auto newAuthTicket = login();
         if (newAuthTicket.token == "") {
             if (status == "connection_error") {
+                noteFailedPoll();
                 return existingReadings;  // temporary login problem, keep the last value
             }
             status = "login_failed";
@@ -343,6 +378,12 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::updateReadings(
         existingReadings.size() > 0 ? existingReadings.back().epoch : 0;
 
     auto glucoseReadings = getReadings(lastReadingEpoch);
+
+    if (status == "connection_error") {
+        noteFailedPoll();
+    } else {
+        consecutiveFailedPolls = 0;
+    }
 
     // sort the readings by epoch
     glucoseReadings.sort(
@@ -469,11 +510,13 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::getReadings(unsigned long long la
     if (error) {
         DEBUG_PRINTF("Error deserializing LibreLinkUp glucose response: %s, using current reading only\n",
             error.c_str());
+        client->end();
         return std::list<GlucoseReading>{readingFromConnection};
     }
 
     if (doc["status"].as<int>() != 0) {
         DEBUG_PRINTF("LibreLinkUp graph returned non-zero status, using current reading only\n");
+        client->end();
         return std::list<GlucoseReading>{readingFromConnection};
     }
     auto values = doc["data"]["graphData"].as<JsonArray>();
