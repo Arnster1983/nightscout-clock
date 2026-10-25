@@ -464,25 +464,18 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::getReadings(unsigned long long la
 
     DeserializationError error = deserializeJson(doc, response, filterOption);
     // DeserializationError error = deserializeJson(doc, response);
+    // The graph call only backfills history. If its response is broken (empty, truncated
+    // = IncompleteInput, or a non-zero status), keep the valid current reading from
+    // /connections instead of stopping the clock with a fatal error.
     if (error) {
-        if (error == DeserializationError::EmptyInput) {
-            DEBUG_PRINTLN("Empty response from LibreLinkUp, no data to process");
-            retryCount += 1;
-            if (retryCount <= MAX_RETRY_COUNT) {
-                return std::list<GlucoseReading>{readingFromConnection};
-            }
-        }
-        DEBUG_PRINTF(
-            "Error deserializing LibreLinkUp glucose response: %s\nFailed on string: %s\n",
-            error.c_str(), response.c_str());
-        status = "get_glucose_failed";
-        DisplayManager.showFatalError(String("Invalid LibreLinkUp glucose response: ") + error.c_str());
+        DEBUG_PRINTF("Error deserializing LibreLinkUp glucose response: %s, using current reading only\n",
+            error.c_str());
+        return std::list<GlucoseReading>{readingFromConnection};
     }
 
     if (doc["status"].as<int>() != 0) {
-        DEBUG_PRINTF("Failed to get glucose from LibreLinkUp, non-zero status %s\n", response.c_str());
-        status = "get_glucose_failed";
-        DisplayManager.showFatalError("Failed to get glucose from LibreLinkUp, please restart");
+        DEBUG_PRINTF("LibreLinkUp graph returned non-zero status, using current reading only\n");
+        return std::list<GlucoseReading>{readingFromConnection};
     }
     auto values = doc["data"]["graphData"].as<JsonArray>();
 #ifdef DEBUG_BG_SOURCE
