@@ -11,17 +11,38 @@ static uint16_t consecutiveFailedPolls = 0;
 // after Abbott refused a login (401/403/429) wait before the next login attempt
 static unsigned long long loginRetryAfter = 0;
 #define LOGIN_BACKOFF_SECONDS 600
-#define FAILED_POLLS_SHOW_ERROR 60
+#define FAILED_POLLS_RESET_HTTP 60
 
-static void noteFailedPoll() {
-    consecutiveFailedPolls++;
-    // About one hour of errors while the WiFi itself is up: this is no longer temporary.
-    // Tell the user (the error screen restarts the clock afterwards, which also clears a
-    // stuck network/TLS state). While the WiFi is down we just wait: WiFi auto-reconnect is
-    // on, and a restart without WiFi would put the clock into access point mode.
-    if (consecutiveFailedPolls >= FAILED_POLLS_SHOW_ERROR && WiFi.status() == WL_CONNECTED) {
-        DisplayManager.showFatalError("No LibreLinkUp data for 1 hour, check internet and LibreLinkUp app");
+// Counts a poll that failed with a temporary error. Returns true when the HTTP/TLS clients
+// should be recreated (about once per hour of errors while the WiFi is up), as a silent
+// replacement for the self-healing restart the old error screen used to do. The display
+// keeps showing the last value with the "data old" marker the whole time.
+static bool noteFailedPoll() {
+    if (WiFi.status() != WL_CONNECTED) {
+        // WiFi down: only wait for the automatic WiFi reconnect, do not count
+        consecutiveFailedPolls = 0;
+        return false;
     }
+    consecutiveFailedPolls++;
+    if (consecutiveFailedPolls >= FAILED_POLLS_RESET_HTTP) {
+        consecutiveFailedPolls = 0;
+        return true;
+    }
+    return false;
+}
+
+// A measurement time is plausible if it is after 2020 and not more than 5 minutes in the
+// future (the future check only once the clock knows the time).
+static bool plausibleEpoch(unsigned long long epoch) {
+    const unsigned long long year2020 = 1577836800ULL;
+    unsigned long long now = (unsigned long long)time(NULL);
+    if (epoch < year2020) {
+        return false;
+    }
+    if (now >= year2020 && epoch > now + 300) {
+        return false;
+    }
+    return true;
 }
 
 bool BGSourceLibreLinkUp::hasValidAuthentication() {
@@ -128,6 +149,7 @@ AuthTicket BGSourceLibreLinkUp::login() {
             "Error deserializing LibreLinkUp login response: %s\nFailed on string: %s\n", error.c_str(),
             response.c_str());
         status = "connection_error";
+        client->end();
         return AuthTicket();  // temporary, retry on the next poll
     }
 
@@ -331,7 +353,7 @@ GlucoseReading BGSourceLibreLinkUp::getLibreLinkUpConnection() {
 
     status = "connected";
     firstConnectionSuccess = true;
-    if (reading.sgv <= 0 || reading.epoch == 0) {
+    if (reading.sgv <= 0 || !plausibleEpoch(reading.epoch)) {
         // no current measurement (e.g. sensor ended): never show it as a fresh value
         return GlucoseReading();
     }
@@ -352,11 +374,24 @@ String BGSourceLibreLinkUp::encodeSHA256(String toEncode) {
     return encoded;
 }
 
+void BGSourceLibreLinkUp::resetHttpClients() {
+    DEBUG_PRINTLN("Long LibreLinkUp outage: recreating HTTP clients and logging in again");
+    client->end();
+    delete client;
+    delete wifiSecureClient;
+    client = new HTTPClient();
+    wifiSecureClient = new WiFiClientSecure();
+    wifiSecureClient->setInsecure();
+    deleteAuthTicket();
+}
+
 std::list<GlucoseReading> BGSourceLibreLinkUp::updateReadings(
     std::list<GlucoseReading> existingReadings) {
     if (!hasValidAuthentication()) {
         if (time(NULL) < loginRetryAfter) {
-            noteFailedPoll();  // Abbott refused the last login, wait before trying again
+            if (noteFailedPoll()) {  // Abbott refused the last login, wait before trying again
+                resetHttpClients();
+            }
             return existingReadings;
         }
         deleteAuthTicket();
@@ -364,7 +399,9 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::updateReadings(
         auto newAuthTicket = login();
         if (newAuthTicket.token == "") {
             if (status == "connection_error") {
-                noteFailedPoll();
+                if (noteFailedPoll()) {
+                    resetHttpClients();
+                }
                 return existingReadings;  // temporary login problem, keep the last value
             }
             status = "login_failed";
@@ -380,7 +417,9 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::updateReadings(
     auto glucoseReadings = getReadings(lastReadingEpoch);
 
     if (status == "connection_error") {
-        noteFailedPoll();
+        if (noteFailedPoll()) {
+            resetHttpClients();
+        }
     } else {
         consecutiveFailedPolls = 0;
     }
@@ -536,10 +575,8 @@ std::list<GlucoseReading> BGSourceLibreLinkUp::getReadings(unsigned long long la
         //     "Reading date: %s, epoch: %llu, seconds ago: %d\n", dateString.c_str(), reading.epoch,
         //     reading.getSecondsAgo());
 
-        if (reading.getSecondsAgo() < 0) {
-            DEBUG_PRINTF(
-                "Reading from the future: %s: %s: %lu\n", dateString.c_str(), reading.toString().c_str(),
-                time(NULL));
+        if (reading.sgv <= 0 || !plausibleEpoch(reading.epoch)) {
+            continue;  // skip broken or future history values
         }
 
         glucoseReadings.push_front(reading);
